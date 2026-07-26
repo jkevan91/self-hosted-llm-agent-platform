@@ -103,10 +103,29 @@ plan_fan_curve(host, curve, reason)  →  shows current vs proposed, returns a o
 apply_fan_curve(confirm_token)       →  refuses without a matching token under 30 minutes old
 ```
 
-The model cannot reach the second call without surfacing the first to a human. Plans are held
-in memory, so a restart invalidates them — a stale plan should not survive.
+This gate **surfaces intent**: the plan and its diff go through the chat transcript where a human
+sees them, and the tools ship listed in the agent's `tools.exclude` until they've been drilled by
+hand. Plans are held in memory, so a restart invalidates them — a stale plan should not survive.
 
-Change tools ship listed in the agent's `tools.exclude` until they've been drilled by hand.
+### Where surfacing isn't enough — and the honest limit of this gate
+
+Be precise about what this buys. The confirm token is returned *to the model*, so the model can
+call `plan_*` and then `apply_*` itself in the same turn. For a fan curve or a device-config change
+that's acceptable: the action is low-consequence and reversible, the diff is visible in the
+transcript, and the tool is disabled until deliberately enabled. The gate's job there is to make a
+change **visible and rollback-able**, not to require a second party.
+
+For a genuinely dangerous action — running an exploit — a gate the model can satisfy by itself is
+**not a human gate at all.** That's a real weakness, and it was a finding against an early version of
+this pattern. The fix is a different, stronger gate used only where it's warranted:
+[kali-recon](projects/kali-recon.md#safety-model--why-the-model-cant-cheat) puts approval **out of
+band entirely** — there is no tool that approves, and the signing secret is never in the model's
+context, so the model structurally cannot approve its own request. The dashboard is a second human
+surface that can.
+
+The principle underneath: **if a check can be satisfied by the thing being checked, it isn't a
+check.** Matching the strength of the gate to the consequence of the action — surfacing for the
+reversible, un-self-approvable for the dangerous — is the deliberate design, not an inconsistency.
 
 ---
 

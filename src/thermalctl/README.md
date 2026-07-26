@@ -1,6 +1,6 @@
 # thermalctl — worked example
 
-The most complete of the four servers, included because it exercises every pattern in this
+The most complete of the servers, included because it exercises every pattern in this
 system: a hard security boundary, two auto-detected hardware backends, ephemeral control with
 safety bounds, and a two-phase gate for persistent change.
 

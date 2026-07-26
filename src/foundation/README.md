@@ -1,6 +1,6 @@
 # Foundation — the rules every MCP server here follows
 
-Distilled from building four servers. Split into rules that are **mandatory for the protocol**,
+Distilled from building six servers. Split into rules that are **mandatory for the protocol**,
 rules that are **mandatory for safety**, and design guidance for the fact that the caller is a
 language model.
 

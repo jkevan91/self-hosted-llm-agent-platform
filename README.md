@@ -2,12 +2,16 @@
 
 A home lab where a **locally-hosted language model** operates real infrastructure through
 purpose-built [MCP](https://modelcontextprotocol.io) servers — network diagnostics, media
-devices, mail and calendar, and hardware thermal/lighting control — reached from a phone over
-a chat client.
+devices, mail and calendar, hardware thermal/lighting control, read-only host inspection, and
+subnet-locked security scanning — reached from a phone over a chat client.
 
 No cloud inference. No vendor agent framework. The model runs on a GPU in the house, and every
 capability it has was designed, threat-modelled, and built as a separate service with its own
 safety posture.
+
+> **New here?** [**docs/00-plain-english.md**](docs/00-plain-english.md) explains the whole
+> system with no jargon. A [**tour of every project**](docs/projects/) sits one level of detail
+> up. Everything else assumes you're technical.
 
 > **About this repository.** This is a sanitized public write-up of a private production
 > system. Hostnames, addresses, serials, keys and account identifiers are placeholders. The
@@ -21,8 +25,8 @@ safety posture.
 | --- | --- |
 | **Security engineering** | An agent that controls a hypervisor without ever holding a shell on it — SSH forced commands, verb allowlists, capability-scoped keys; the command-executing sandbox runs rootless, so escaping it is not host root |
 | **Systems / virtualization** | Bare-metal → Proxmox migration, VFIO GPU passthrough, physical-to-virtual conversion, a single GPU handed between two VMs with no host reboot |
-| **API & protocol work** | Four MCP servers over stdio JSON-RPC, OAuth 2.0 refresh-token flows, hardware control via sysfs/HID |
-| **Debugging rigor** | Three separate "reports success, does nothing" bugs found and proven by measurement — see [the debugging log](docs/05-debugging-log.md) |
+| **API & protocol work** | Six MCP servers speaking JSON-RPC over stdio or loopback HTTP, OAuth 2.0 refresh-token flows, hardware control via sysfs/HID |
+| **Debugging rigor** | Multiple "reports success, does nothing" bugs found and proven by measurement — see [the debugging log](docs/05-debugging-log.md) |
 | **Operational discipline** | Dry-run-by-default tooling, two-phase change gates, documented rollback paths, honest after-action reports |
 
 ---
@@ -30,40 +34,39 @@ safety posture.
 ## Architecture
 
 ```
-         phone
-           │  chat message
-           ▼
-    ┌─────────────┐
-    │ chat gateway│  allowlisted users only
-    └──────┬──────┘
-           ▼
-    ┌──────────────────────┐        ┌────────────────────┐
-    │   agent runtime      │───────▶│  local LLM server  │  GPU inference
+         phone                                    ┌──────────────┐
+           │  chat message           browser ────▶│  security-    │  plain-language health,
+           ▼                          (LAN)       │  dashboard    │  change alerts, Approve/Deny
+    ┌─────────────┐                               └──────┬───────┘
+    │ chat gateway│  allowlisted users only              │ writes only a signed approval marker
+    └──────┬──────┘                                       │ (no path to start a scan)
+           ▼                                              ▼
+    ┌──────────────────────┐        ┌─────────────────────┐
+    │   agent runtime      │───────▶│  local LLM server   │  GPU inference
     │  (tool orchestration)│        │  (OpenAI-compatible)│  64k context
-    └──────┬───────────────┘        └────────────────────┘
+    └──────┬───────────────┘        └─────────────────────┘
            │  MCP over loopback HTTP (one service per server)
-           ├──────────────┬───────────────┬──────────────┐
-           ▼              ▼               ▼              ▼
-      ┌─────────┐   ┌──────────┐   ┌──────────┐   ┌────────────┐
-      │ netadmin│   │ mediactl │   │  gsuite  │   │ thermalctl │
-      │ network │   │ AV device│   │ mail/cal │   │ fans + RGB │
-      │  diag   │   │  control │   │          │   │            │
-      └────┬────┘   └────┬─────┘   └────┬─────┘   └─────┬──────┘
-           │             │              │               │
-           ▼             ▼              ▼               ▼
-       LAN hosts     AV devices     Google APIs    hypervisor +
-                                                   media server
-                                                  (forced-command SSH)
+           ├──────────┬──────────┬──────────┬──────────┬──────────┐
+           ▼          ▼          ▼          ▼          ▼          ▼
+      ┌────────┐ ┌────────┐ ┌────────┐ ┌─────────┐ ┌────────┐ ┌──────────┐
+      │netadmin│ │mediactl│ │ gsuite │ │thermalctl│ │hoststat│ │kali-recon│
+      │network │ │AV dev  │ │mail/cal│ │fans+RGB │ │host    │ │scan +    │
+      │diag+cfg│ │control │ │        │ │+ thermal│ │inspect │ │gated pwn │
+      └───┬────┘ └───┬────┘ └───┬────┘ └────┬────┘ └───┬────┘ └────┬─────┘
+          ▼          ▼          ▼           ▼          ▼           ▼
+      LAN hosts   AV devices Google APIs  hypervisor  own host   LAN, in
+      (2-phase    (ephemeral (no send /   (forced-cmd (read-only  hard-coded
+       gate)       only)      no delete)   SSH)        forced-cmd) scope only
 ```
 
 Everything below the agent runtime lives in its own container, running non-root, holding only
-the credentials it needs.
+the credentials it needs. The **dashboard** and the **security scanner** share one out-of-band
+human-approval boundary the model has no tool to reach — see
+[kali-recon](docs/projects/kali-recon.md).
 
-*A fifth server, **hoststat**, gives the agent a read-only view of its own host — memory,
-processes, disk, services — for diagnostics. Same forced-command SSH pattern as thermalctl, but
-read-only verbs only, so there is nothing to gate. The agent's command sandboxes run on a separate
-**rootless** container daemon; the service containers are root-managed system services the agent
-account can't touch. See [the security model](docs/03-security-model.md#principle-5--the-sandbox-must-not-be-the-host).*
+*The agent's command sandboxes run on a separate **rootless** container daemon; the service
+containers are root-managed system services the agent account can't touch. See
+[the security model](docs/03-security-model.md#principle-5--the-sandbox-must-not-be-the-host).*
 
 ---
 
@@ -79,7 +82,8 @@ the assistant only goes offline when that's a deliberate choice. The handoff rou
 about a minute each way with **no host reboot**, by attaching and detaching the PCI device on
 the stopped VM rather than declaring it statically in both configs.
 
-A second box runs media services and is managed by the same agent.
+A second box runs media services; the agent monitors it read-only (it isn't wired for
+agent-driven changes). See [docs/projects/media-server.md](docs/projects/media-server.md).
 
 See [docs/04-virtualization.md](docs/04-virtualization.md).
 
@@ -94,9 +98,15 @@ See [docs/04-virtualization.md](docs/04-virtualization.md).
 | **gsuite** | Mail search/read/triage, calendar read, a "waiting on a reply" watchlist | Reversible only — **no send, no delete tools exist** |
 | **thermalctl** | Fan speeds, RGB lighting, thermal telemetry across hosts | Ephemeral + a two-phase gate for persistent curves |
 | **hoststat** | Read-only host inspection — memory, processes, disk, sockets, service status/logs | Read-only — no gate, because no write path exists |
+| **kali-recon** | Security scanning, network monitoring, gated exploitation of the LAN | **Subnet-locked in source** + out-of-band human approval for anything intrusive |
 
 They share a common foundation — see [docs/02-mcp-servers.md](docs/02-mcp-servers.md) and
-[src/foundation](src/foundation).
+[src/foundation](src/foundation). A per-project tour, plain-English first, is in
+[docs/projects](docs/projects/).
+
+A **[security dashboard](docs/projects/security-dashboard.md)** sits alongside them: a
+LAN-only, password-gated web page showing plain-language health and change alerts, and acting as
+a second human approval surface for the scanner's intrusive actions.
 
 ---
 
@@ -156,12 +166,14 @@ be measured, measure it. Full write-ups in [docs/05-debugging-log.md](docs/05-de
 
 ```
 docs/
+  00-plain-english.md       the whole system with no jargon — start here if non-technical
   01-architecture.md        the stack, layer by layer
   02-mcp-servers.md         server design, the shared foundation, LLM-facing API design
   03-security-model.md      threat model and the controls that answer it
   04-virtualization.md      Proxmox, VFIO passthrough, P2V, the GPU handoff
   05-debugging-log.md       silent-failure bugs, how each was proven
   06-engineering-practices.md  dry-run tooling, docs policy, after-action reports
+  projects/                 a tour of all nine pieces, plain-English → architecture → safety
 src/
   foundation/               the rules every MCP server in this system follows
   thermalctl/               the forced-command agent + MCP server (most complete example)

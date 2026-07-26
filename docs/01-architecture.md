@@ -14,8 +14,8 @@
 │                24 GB GPU · 14B-class tool-calling model      │
 │                64k context                                   │
 ├──────────────────────────────────────────────────────────────┤
-│ Capability     four MCP servers, stdio JSON-RPC              │
-│                one container each, non-root                  │
+│ Capability     six MCP servers, JSON-RPC over stdio or       │
+│                loopback HTTP · one container each, non-root  │
 ├──────────────────────────────────────────────────────────────┤
 │ Target         LAN hosts · AV devices · SaaS APIs ·          │
 │                hypervisor + media server hardware            │
@@ -29,7 +29,7 @@
 | `hypervisor` | Bare metal. Proxmox host. Owns the fan and lighting hardware. |
 | `gaming-vm` | Windows guest. Holds the GPU on demand. |
 | `llm-vm` | Linux guest. Model server, agent runtime, all MCP servers. |
-| `mediaserver` | Separate box. Media services; managed by the agent. |
+| `mediaserver` | Separate box. Media services; monitored read-only by the agent. |
 
 Addresses in this repository are placeholders in `10.0.0.0/24`.
 
@@ -59,11 +59,25 @@ before a model is wired in rather than assumed from a model card.
 
 ## Transport
 
-MCP servers attach over **stdio**, each launched as a container by the agent runtime and
-supervised by a watchdog process. No network listeners, no ports, no service discovery — the
-transport is the process's own stdin/stdout.
+The system runs **two transports**, and which one is used is itself a security decision.
 
-Consequences worth knowing:
+**Originally, stdio.** Each server was launched as a container by the agent runtime and spoke
+JSON-RPC over its own stdin/stdout — no network listeners, no ports, no service discovery. Simple
+and textbook-correct, but it has a hidden cost: **the agent account needs container-daemon access
+to launch the servers.** When the host was hardened so that account holds no container privilege at
+all ([security model, Principle 5](03-security-model.md#principle-5--the-sandbox-must-not-be-the-host)),
+that launch model had to change.
+
+**Now, loopback HTTP for the long-running servers.** Each runs as an independent, root-managed
+system service and speaks MCP over streamable-HTTP bound to host loopback; the agent attaches by URL
+instead of spawning a process. The code needed one backward-compatible change — honour a transport
+environment variable, defaulting to stdio — so the same image runs either way, and the agent's own
+throwaway command sandboxes still use stdio on the rootless daemon. The lesson is in
+[docs/02](02-mcp-servers.md#transport-from-stdio-subprocesses-to-loopback-services): *a transport
+choice can be a security boundary.*
+
+The stdio consequences below still matter — they governed the original design and still govern the
+sandbox transport and any stdio smoke test:
 
 - **stdout is sacred.** Anything a server prints to stdout corrupts the protocol stream. All
   logging goes to stderr.

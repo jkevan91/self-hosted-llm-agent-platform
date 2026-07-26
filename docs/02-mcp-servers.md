@@ -1,7 +1,8 @@
 # MCP server design
 
-Five servers, one shared foundation. Each is its own container, its own repository, its own
-credentials, and its own safety posture.
+Six servers, one shared foundation. Each is its own container, its own repository, its own
+credentials, and its own safety posture. This page covers the design common to all of them; a
+per-server tour with plain-English framing is in [docs/projects](projects/).
 
 ---
 
@@ -160,6 +161,23 @@ inspect another user's process internals.
 Because there is no verb that changes anything, the server has **no two-phase gate** — there is
 nothing to gate. That's the design goal stated in reverse: the safest write path is the one that
 was never built.
+
+### kali-recon — subnet-locked scanning with a human-gated exploit path
+
+The highest-risk server, and the one whose safety design is the most interesting — so it has its
+own page: [projects/kali-recon.md](projects/kali-recon.md). Two boundaries that don't appear
+anywhere else in the system:
+
+- **Scope is a source-code constant**, not config — the permitted networks can't be widened at
+  runtime by a prompt-injected model or a mistaken operator; every target is resolved (URLs and
+  hostnames included) and checked before any tool runs.
+- **Intrusive actions require an out-of-band human approval the model cannot give itself** — there
+  is no MCP tool that approves, and the approval secret is never in the model's context. This is the
+  corrected version of a plan→apply gate whose token was returned *to the model* (and so wasn't a
+  human gate at all). The principle: **if a check can be satisfied by the thing being checked, it
+  isn't a check.**
+
+Read-only recon and monitoring run freely, in-scope; only attacking/brute-forcing is gated.
 
 ---
 
