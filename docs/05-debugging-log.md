@@ -200,3 +200,42 @@ Two environment quirks that produced confidently wrong conclusions before being 
   wrong one showed a static value and made a working control loop look frozen.
 
 **Rule adopted:** when a diagnostic returns nothing, first prove the diagnostic works.
+
+---
+
+## 8. A tool that was registered, healthy, and invisible
+
+**Symptom.** After adding a new server, the agent insisted one of its tools "isn't available" —
+while every direct check said it was. The service was up, the transport handshake returned the
+full tool list, and the runtime's own registry showed the tool attached and enabled. Yet asked to
+use it, the model claimed it didn't exist, and asked to *find* it first, still gave up.
+
+**The false trails.** Everything pointed at the tool itself or the new server — so both got
+re-verified: the container was healthy, a direct protocol call to the tool returned real data, and
+the registry listing was clean. All green. When every component tests good but the whole fails, the
+fault is in the composition, not a part.
+
+**Root cause.** The runtime has an automatic **tool-deferral** feature: once the combined tool
+definitions exceed a share of the model's context budget, it stops listing every tool inline and
+instead hides them behind a *search → describe → call* bridge, to save tokens. Adding the new
+server pushed the total tool count over that threshold. So the tools didn't disappear — they moved
+behind a lookup the small local model couldn't reliably drive. A larger model would have used the
+bridge; the local one fumbled the indirection and concluded the tool was gone.
+
+The tell was in the timeline, not the components: it had worked with fewer tools and broke on
+crossing a count, which is the signature of a budget threshold, not a broken registration.
+
+**How it was proven.** The threshold is configurable. Turning deferral off — putting every tool
+back inline — made the same model call the same tool correctly on the first try, with no other
+change. Flipping it back reproduced the failure. One toggle, two outcomes: the deferral was the
+cause.
+
+**Fix.** Disable deferral for this deployment. The feature optimizes for a scarce context window
+and a capable model; here the model is the weak link and the context is local and effectively free,
+so the tradeoff inverts — spend the tokens, keep every tool in plain sight. (If the tool count ever
+grows enough to matter, the honest lever is to raise the threshold, not to expect the small model to
+learn the indirection.)
+
+**The lesson.** A capability the model can't *find* is as good as absent, and "the tool works" and
+"the model can use the tool" are different claims that need testing separately. The bug was not in
+any component — it was in an optimization that assumed a stronger caller than this system has.

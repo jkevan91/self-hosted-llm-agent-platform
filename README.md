@@ -19,7 +19,7 @@ safety posture.
 
 | Area | Evidence |
 | --- | --- |
-| **Security engineering** | An agent that controls a hypervisor without ever holding a shell on it — SSH forced commands, verb allowlists, capability-scoped keys |
+| **Security engineering** | An agent that controls a hypervisor without ever holding a shell on it — SSH forced commands, verb allowlists, capability-scoped keys; the command-executing sandbox runs rootless, so escaping it is not host root |
 | **Systems / virtualization** | Bare-metal → Proxmox migration, VFIO GPU passthrough, physical-to-virtual conversion, a single GPU handed between two VMs with no host reboot |
 | **API & protocol work** | Four MCP servers over stdio JSON-RPC, OAuth 2.0 refresh-token flows, hardware control via sysfs/HID |
 | **Debugging rigor** | Three separate "reports success, does nothing" bugs found and proven by measurement — see [the debugging log](docs/05-debugging-log.md) |
@@ -41,7 +41,7 @@ safety posture.
     │   agent runtime      │───────▶│  local LLM server  │  GPU inference
     │  (tool orchestration)│        │  (OpenAI-compatible)│  64k context
     └──────┬───────────────┘        └────────────────────┘
-           │  MCP over stdio (one container per server)
+           │  MCP over loopback HTTP (one service per server)
            ├──────────────┬───────────────┬──────────────┐
            ▼              ▼               ▼              ▼
       ┌─────────┐   ┌──────────┐   ┌──────────┐   ┌────────────┐
@@ -58,6 +58,12 @@ safety posture.
 
 Everything below the agent runtime lives in its own container, running non-root, holding only
 the credentials it needs.
+
+*A fifth server, **hoststat**, gives the agent a read-only view of its own host — memory,
+processes, disk, services — for diagnostics. Same forced-command SSH pattern as thermalctl, but
+read-only verbs only, so there is nothing to gate. The agent's command sandboxes run on a separate
+**rootless** container daemon; the service containers are root-managed system services the agent
+account can't touch. See [the security model](docs/03-security-model.md#principle-5--the-sandbox-must-not-be-the-host).*
 
 ---
 
@@ -87,6 +93,7 @@ See [docs/04-virtualization.md](docs/04-virtualization.md).
 | **mediactl** | AV device discovery and control (power, transport, app launch, volume) | Ephemeral only |
 | **gsuite** | Mail search/read/triage, calendar read, a "waiting on a reply" watchlist | Reversible only — **no send, no delete tools exist** |
 | **thermalctl** | Fan speeds, RGB lighting, thermal telemetry across hosts | Ephemeral + a two-phase gate for persistent curves |
+| **hoststat** | Read-only host inspection — memory, processes, disk, sockets, service status/logs | Read-only — no gate, because no write path exists |
 
 They share a common foundation — see [docs/02-mcp-servers.md](docs/02-mcp-servers.md) and
 [src/foundation](src/foundation).

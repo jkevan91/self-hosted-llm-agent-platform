@@ -1,6 +1,6 @@
 # MCP server design
 
-Four servers, one shared foundation. Each is its own container, its own repository, its own
+Five servers, one shared foundation. Each is its own container, its own repository, its own
 credentials, and its own safety posture.
 
 ---
@@ -141,3 +141,44 @@ fan backends:
 | **vendor USB library** | The controller's serial | Needed for USB fan controllers; on the reference hardware it does not work at all |
 
 hwmon wins where both are present, for exactly the reason the debugging log documents.
+
+### hoststat — read-only host inspection
+
+Added so the assistant could **explain** a problem, not just report the gauge reading. The
+dashboard already showed "memory is high on the agent host"; what it couldn't do was say *why*.
+`hoststat` gives the agent a read-only look at the host it runs on: memory breakdown, top
+processes by memory or CPU, disk usage, listening sockets, and one service's status or recent
+logs.
+
+It reaches the host the same way `thermalctl` reaches the hypervisor — an SSH key **pinned to a
+forced command** — but the dispatcher on the far end knows only read-only verbs
+(`summary | mem | proc | disk | sockets | svc-status | svc-logs`), parses its argument into an
+array with no shell involved, validates unit names by charset, and clamps counts. It logs in as an
+**unprivileged** account, which is enough for "what's eating memory" and deliberately not enough to
+inspect another user's process internals.
+
+Because there is no verb that changes anything, the server has **no two-phase gate** — there is
+nothing to gate. That's the design goal stated in reverse: the safest write path is the one that
+was never built.
+
+---
+
+## Transport: from stdio subprocesses to loopback services
+
+The servers originally ran the textbook MCP way — the agent launched each as a child process and
+spoke JSON-RPC over stdio. That is simple and it works, but it has a hidden cost: **the agent
+account needs container-daemon access to launch them.** When the host was hardened so the agent
+account holds no container privilege at all (see
+[security model, Principle 5](03-security-model.md#principle-5--the-sandbox-must-not-be-the-host)),
+that launch model had to go.
+
+Now each server runs as an **independent, root-managed system service** and speaks MCP over
+**streamable-HTTP bound to host loopback**; the agent attaches by URL instead of by spawning a
+process. The server code needed one small, backward-compatible change — honour a transport
+environment variable, defaulting to stdio — so the same image runs either way. Loopback-only
+binding keeps the endpoints off the network; verified with an external probe that the ports refuse
+connections from anywhere but the host itself.
+
+The lesson worth keeping: **a transport choice can be a security boundary.** Moving from "the
+agent spawns the tool" to "the agent calls the tool" removed a whole category of privilege from the
+most exposed account.

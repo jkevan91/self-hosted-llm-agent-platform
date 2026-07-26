@@ -130,6 +130,59 @@ assuming a sensible one.
 
 ---
 
+## Principle 5 — the sandbox must not be the host
+
+The agent can run shell commands. That capability lives in a throwaway container, which is the
+right instinct — but sandboxing the *process* is worthless if the *account that launches it* can
+reach the container daemon. That was the real hole in the first design:
+
+- the agent's shell ran in a container (good), **but**
+- the account running the agent was in the container-management group, and the daemon was the
+  ordinary root daemon. Anything that escaped the sandbox, or simply reached the daemon socket,
+  became host root. The container was a speed bump, not a boundary.
+
+### The fix, and why it wasn't a one-liner
+
+The clean answer is a **rootless container daemon**: it runs under the user's own namespace, so
+"root inside the container" maps to an unprivileged host uid, and the account can be dropped from
+the privileged container group entirely. Escaping the sandbox now lands you as a nobody.
+
+The catch: the long-running service containers (the MCP servers, the dashboard) used **host
+networking**, and under a rootless daemon host networking is a *private* network namespace, not
+the real host. Flipping everything to rootless would have silently broken every capability that
+depends on real network adjacency — multicast device discovery, LAN scanning, and a loopback call
+one service makes to the agent's API. Half the system would have "worked" in tests and failed in
+practice.
+
+So the split is by **trust**, not convenience:
+
+- The part that executes model-influenced commands — the agent's own sandboxes — moved to the
+  **rootless** daemon. That's the only part an injection can steer.
+- The fixed, audited service containers stayed on the root daemon, but as **root-managed system
+  services the operator account cannot touch**, not containers the agent launches.
+
+That last move required changing how the agent reaches those services: from launching each one as
+a child process over stdio (which needs daemon access) to connecting to them as independent
+services over **loopback HTTP**. More moving parts, but the agent account no longer needs any
+container privilege at all.
+
+### Verified, not assumed
+
+From a fresh login after the change:
+
+| Check | Result |
+| --- | --- |
+| Operator account in the container-management group | ❌ removed |
+| Root daemon socket, as the operator | ❌ `permission denied` |
+| "Root" inside an agent sandbox → host uid | mapped to an **unprivileged** uid, not 0 |
+| Multicast device discovery | ✅ still works |
+| LAN scan / loopback API call | ✅ still works |
+
+The principle underneath: **the component that runs untrusted-influenced input must not share a
+trust boundary with the host.** A sandbox whose launcher holds the keys to the host is theatre.
+
+---
+
 ## Deliberate residual risks
 
 Documented rather than hidden:
