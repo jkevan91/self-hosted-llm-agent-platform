@@ -1,0 +1,202 @@
+# Debugging log — when software lies about succeeding
+
+The hardest bugs in this project were not crashes. They were things that **reported success and
+did nothing**. Each one is written up here with how it was proven, because the proof is the
+interesting part.
+
+The common lesson: **an API that doesn't raise is not an API that worked.** Where an effect can
+be measured, measure it.
+
+---
+
+## 1. A fan curve that never controlled the fans
+
+**Symptom.** None. That was the problem. A service had been running for weeks, reading a
+temperature sensor, computing duty percentages, and logging clean transitions:
+
+```
+fan-curve[…]: case=51C -> fans 43%
+fan-curve[…]: case=52C -> fans 45%
+```
+
+Everything looked healthy. It was discovered only while building a tool that needed to set fan
+speeds through the same library and got errors the service never showed.
+
+**Root cause, two parts.**
+
+The vendor library cannot write to this fan controller. It tags the device `(broken)` in its
+own device listing, and every write form fails:
+
+```
+$ liquidctl --serial <redacted> set fan1 speed 100
+ERROR: <controller> (broken): unspecified liquidctl error
+```
+
+`set fans speed` (all channels), an `--unsafe` opt-in flag, and running `initialize` first all
+fail identically. Reads — RPM, temperatures — work perfectly, which is what makes it so
+convincing from the outside.
+
+And the service was hiding it:
+
+```bash
+liquidctl --serial "$SERIAL" set fan"$f" speed "$pct" >/dev/null 2>&1
+#                                                     ^^^^^^^^^^^^^^^
+```
+
+Errors went to `/dev/null`. The loop then logged a transition based on the value it had
+*computed*, never checking whether the hardware accepted it.
+
+**How it was proven.** Not by reading the error text — by measurement. All five channels
+commanded to 100%, 30 seconds to settle, then 30%, 30 seconds to settle:
+
+| Commanded | Fan 1 | Fan 2 | Fan 3 | Fan 4 | Fan 5 |
+| --- | --- | --- | --- | --- | --- |
+| **100%** | 624 | 614 | 635 | 598 | 616 |
+| **30%** | 628 | 617 | 636 | 603 | 611 |
+
+Identical within noise. That table is the whole argument, and it's why the earlier
+"validated under load" claim — fans reading 727→756 rpm as the curve moved 43%→45% — had to be
+withdrawn. A 29 rpm drift is thermal noise, not a 2% duty change. The original reading assumed
+the correlation it was trying to demonstrate.
+
+**Fixes.**
+
+- The service now captures stderr, counts per-channel results, and emits a loud rate-limited
+  error when every channel fails.
+- It no longer logs a curve transition it didn't achieve.
+- The new MCP tool refuses to report success, and restores automatic control rather than
+  leaving the curve stopped after a change that never landed.
+- The documentation claiming working fan control was corrected, including the after-action
+  report.
+
+**Not an emergency, and saying so matters.** The fans free-run at a safe speed and the machine
+is heavily over-cooled — under sustained full-GPU load the case sensor moved 0.4 °C and the GPU
+held 45 °C on its own fans. Cooling was always adequate. It simply was never being *controlled*.
+Reporting a scary-sounding finding without that context would have been its own kind of
+inaccuracy.
+
+---
+
+## 2. Same class of bug, different vendor: the lighting CLI
+
+**Symptom.** `<tool> --noautoconnect -d 0 -m off` exits **0**, prints a complete and correct
+device detection, and changes nothing. Repeatedly. The active mode never changes.
+
+**Root cause.** That CLI path doesn't write. Only the SDK-server path (`--server`, then a
+`--client` connection to it) actually applies changes. Both are documented; only one works.
+
+**Fix.** Run the daemon and drive it as a client. And bind it to loopback while you're there —
+its default is all-interfaces with no auth.
+
+**Also found here:** a second library was tried first for the same job and was worse — its
+"set colour off" call returns success and applies nothing, and its other colour method is
+literally `raise NotSupportedByDriver`. Clean division in the end: **one library owns fan
+speeds, the other owns lighting, and they are never crossed.**
+
+**A third trap, in the same tool.** Its client opens two connections and concatenates both
+controller lists, so every device is reported **twice** — 12 entries for 6 devices. Deduping by
+name would be wrong, because two of the devices are genuinely distinct units with identical
+model names. The correct fix detects the exact doubling (first half's names equal second
+half's) and keeps one half.
+
+---
+
+## 3. A device API that acks invalid identifiers
+
+**Symptom.** An "launch app on device" tool reported ✅ while the device sat idle.
+
+**Root cause.** The remote protocol accepts *any* string as an app identifier, acknowledges it
+with no error, and does nothing when it doesn't match. Meanwhile the model was passing the app's
+**human name** ("Netflix") because that's what a human said, while the device wanted an exact
+reverse-DNS bundle identifier.
+
+**Fix, and the generalizable lesson.** Resolve names to IDs **inside the tool**: fetch the
+device's own installed-app list, match exact-ID → exact-name → substring (case-insensitive),
+launch the resolved ID, and return a disambiguation error listing real options when the match
+is empty or ambiguous.
+
+**The caller is a language model, and it will pass human-friendly strings.** Any tool wrapping
+an API that needs stable identifiers should do that resolution itself rather than pushing the
+burden onto the caller, which will guess and guess wrong. This is now a rule in the shared
+foundation.
+
+---
+
+## 4. ACPI silently holding a hardware interface
+
+**Symptom.** A motherboard sensor chip that clearly exists, exposing nothing. No fan readings,
+no PWM control files.
+
+**Diagnosis.** The kernel module finds the chip and then gives up:
+
+```
+nct6775: Found NCT6791D or compatible chip at 0x2e:0x290
+ACPI: OSL: Resource conflict; ACPI support missing from driver?
+```
+
+ACPI had claimed the chip's I/O range, so the driver refused to register rather than risk two
+things driving the same hardware. A vendor-specific alternative driver also loads cleanly on
+this board and registers nothing at all — a dead end that looks like progress.
+
+**Fix.** `acpi_enforce_resources=lax` on the kernel command line, plus a reboot. The chip then
+appeared with six PWM channels, and control turned out to be genuinely proportional:
+
+| Commanded | Chassis fan RPM |
+| --- | --- |
+| baseline (BIOS curve) | 733 |
+| 40% | 488 |
+| 80% | 831 |
+| 100% | 944 |
+| restored | 734 |
+
+Same measurement discipline as finding #1 — and this time it earned a ✅ that means something,
+because the numbers move.
+
+**Two traps worth knowing.** `pwmN_enable` values are chip-specific: on this family `1` is
+manual and `5` is the BIOS curve, but **`0` means full-speed-ignoring-duty** — a channel reading
+mode 0 is *not* under your control even though writes appear to land. And `hwmonN` indices are
+assigned in probe order and **move between boots**, so anything durable must resolve the chip by
+name.
+
+---
+
+## 5. Two failures that were really one environment assumption
+
+Both from the same root: **a process started by `sshd` as a forced command, or by a systemd
+timer, begins with an almost-empty environment.** No login shell, no profile.
+
+- **Config never loaded.** The agent read its settings from environment variables that a login
+  shell would have set. Under a forced command they were empty, so every hardware verb refused
+  with a confusing "not configured" error. Fix: the agent sources its own config file explicitly.
+- **A config line that executed.** That file contained `CHANNELS=1 2 3 4 5` — unquoted. Sourcing
+  it made the shell try to run `2` as a command, printing `line 5: 2: command not found` before
+  every single response. Fix: quote it, and quote it in the generator that writes it.
+
+---
+
+## 6. Stale state after a timer fired correctly
+
+**Symptom.** Status reported an active manual override hours after it had expired.
+
+**Root cause.** The expiry timer restarted the automatic service — correctly — but nothing
+removed the marker file recording that an override existed. The automation was fine; the
+*reporting* was wrong, which is arguably worse, because it's the part a human reads.
+
+**Fix.** A small revert helper that clears the marker *and* restarts the service, so "control
+returned" and "we say control returned" cannot diverge. The timer calls the helper, never
+`systemctl` directly.
+
+---
+
+## 7. Debugging tools that lie to you
+
+Two environment quirks that produced confidently wrong conclusions before being spotted:
+
+- **`dmesg` returning empty to a non-root user** (`kernel.dmesg_restrict=1`). Greps against it
+  silently matched nothing, which read as "the feature is absent" rather than "you can't see."
+  This put a wrong hardware conclusion into documentation for days. Prefer `sysfs` for hardware
+  facts.
+- **A near-identically-named sensor.** Two temperature sources with similar labels; grepping the
+  wrong one showed a static value and made a working control loop look frozen.
+
+**Rule adopted:** when a diagnostic returns nothing, first prove the diagnostic works.

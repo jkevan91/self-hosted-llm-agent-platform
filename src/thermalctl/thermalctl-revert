@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# thermalctl-revert — restore automatic control for one subsystem.
+#
+# Invoked only by the systemd transient timer that thermalctl-agent arms when it
+# applies a temporary override. Doing this in a helper (rather than pointing the
+# timer straight at `systemctl restart`) means the override marker in /run is
+# cleared at the same moment control actually returns — otherwise `status` keeps
+# reporting a manual override that already expired.
+#
+# usage: thermalctl-revert <fan|rgb> <unit-to-restart>
+set -uo pipefail
+
+WHAT="${1:-}"
+UNIT="${2:-}"
+STATE_DIR=/run/thermalctl
+
+case "$WHAT" in
+  fan|rgb) ;;
+  *) echo "usage: $0 <fan|rgb> <unit>" >&2; exit 2 ;;
+esac
+[ -n "$UNIT" ] || { echo "usage: $0 <fan|rgb> <unit>" >&2; exit 2; }
+
+rm -f "${STATE_DIR}/${WHAT}.override"
+
+if [ "$UNIT" = "@hwmon" ]; then
+  # hwmon hosts have no service to restart — hand the PWM channels back to the
+  # BIOS curve directly. Read config the same way the agent does; a forced-command
+  # session and a systemd timer both start with an empty environment.
+  [ -r /etc/thermalctl/agent.env ] && { set -a; . /etc/thermalctl/agent.env; set +a; }
+  HWMON_NAME="${THERMALCTL_HWMON_NAME:-}"
+  PWM_CHANNELS="${THERMALCTL_PWM_CHANNELS:-}"
+  PWM_RESTORE="${THERMALCTL_PWM_RESTORE:-5}"
+  for d in /sys/class/hwmon/hwmon*; do
+    [ -r "$d/name" ] || continue
+    if [ "$(cat "$d/name" 2>/dev/null)" = "$HWMON_NAME" ] && [ -e "$d/pwm1" ]; then
+      for ch in $PWM_CHANNELS; do
+        printf '%s' "$PWM_RESTORE" > "$d/pwm${ch}_enable" 2>/dev/null
+      done
+      break
+    fi
+  done
+  logger -t thermalctl-revert "${WHAT} override expired — PWM returned to mode ${PWM_RESTORE}" 2>/dev/null
+  exit 0
+fi
+
+systemctl restart "$UNIT" >/dev/null 2>&1
+logger -t thermalctl-revert "${WHAT} override expired — restarted ${UNIT}" 2>/dev/null

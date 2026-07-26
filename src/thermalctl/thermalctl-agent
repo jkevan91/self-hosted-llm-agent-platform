@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# thermalctl-agent — the ONLY thing an inbound thermalctl SSH key may execute.
+#
+# SECURITY MODEL — read this before changing anything.
+#
+# The agent runtime runs inside a guest VM and drives a local LLM. The fan and RGB
+# hardware is attached to the HYPERVISOR beneath it. Rather than hand the agent an
+# interactive root shell on that host, its key is pinned in authorized_keys with:
+#
+#   command="/usr/local/sbin/thermalctl-agent",no-pty,no-port-forwarding,\
+#   no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 AAAA... thermalctl
+#
+# sshd then IGNORES whatever the client asked to run and executes this script,
+# passing the requested string in $SSH_ORIGINAL_COMMAND. This file parses that
+# string against a fixed verb allowlist. There is no path from a compromised or
+# prompt-injected model to an arbitrary command: an unrecognized verb is refused,
+# and no argument is ever passed to a shell.
+#
+# Consequently: NEVER add a verb that takes free-form text and feeds it to eval,
+# bash -c, or a shell redirect. Every argument below is validated by regex before
+# use, and every external call is a direct argv invocation.
+set -uo pipefail
+umask 022
+
+# A forced-command session gets a near-empty environment — sshd does NOT run the
+# login shell's profile, so per-host settings have to be read explicitly here.
+# Without this the fan serial is empty and every fan verb refuses.
+if [ -r /etc/thermalctl/agent.env ]; then
+  set -a; . /etc/thermalctl/agent.env; set +a
+fi
+
+STATE_DIR=/run/thermalctl
+CURVE_ENV=/etc/thermalctl/fan-curve.env
+LOG_TAG=thermalctl-agent
+
+# Refuse to drive fans below this. A model that sets 0% on a box under GPU load
+# is the failure this exists to prevent. Overridable per-host, but never to 0.
+FAN_FLOOR="${THERMALCTL_FAN_FLOOR:-30}"
+FAN_TTL_DEFAULT="${THERMALCTL_FAN_TTL:-15}"
+RGB_TTL_DEFAULT="${THERMALCTL_RGB_TTL:-60}"
+TTL_MAX=720
+
+WORKING_SERIAL="${THERMALCTL_FAN_SERIAL:-}"
+FAN_CHANNELS="${THERMALCTL_FAN_CHANNELS:-1 2 3 4 5}"
+ORGB_HOST="${THERMALCTL_ORGB_HOST:-127.0.0.1:6742}"
+
+# hwmon/PWM backend (motherboard Super-I/O fan control, e.g. nct6775 on ASUS boards).
+# Identify the chip by NAME, never by hwmonN — the numbering is assigned in probe
+# order and moves between boots.
+HWMON_NAME="${THERMALCTL_HWMON_NAME:-}"
+PWM_CHANNELS="${THERMALCTL_PWM_CHANNELS:-}"
+# Mode to hand the fans back to. 5 = the BIOS smart-fan curve on nct6775 parts,
+# 2 = thermal cruise. Whatever it was before we touched it.
+PWM_RESTORE="${THERMALCTL_PWM_RESTORE:-5}"
+
+hwmon_dir() {
+  local d
+  [ -n "$HWMON_NAME" ] || return 1
+  for d in /sys/class/hwmon/hwmon*; do
+    [ -r "$d/name" ] || continue
+    if [ "$(cat "$d/name" 2>/dev/null)" = "$HWMON_NAME" ] && [ -e "$d/pwm1" ]; then
+      printf '%s' "$d"; return 0
+    fi
+  done
+  return 1
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+log() { logger -t "$LOG_TAG" "$*" 2>/dev/null; }
+die() { printf 'ERR %s\n' "$*"; exit 1; }
+ok()  { printf 'OK %s\n'  "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+unit_exists()  { systemctl cat "$1" >/dev/null 2>&1; }
+unit_active()  { systemctl is-active --quiet "$1"; }
+
+# ---------------------------------------------------------------- validation --
+# Every argument the remote side can influence passes through one of these.
+v_pct()   { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -le 100 ]; }
+v_ttl()   { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "$TTL_MAX" ]; }
+v_hex()   { [[ "$1" =~ ^[0-9a-fA-F]{6}$ ]]; }
+# curve = ascending "temp:pct" points, space separated, e.g. "45:35 52:45 66:100"
+v_curve() { [[ "$1" =~ ^[0-9]{1,3}:[0-9]{1,3}( [0-9]{1,3}:[0-9]{1,3}){0,9}$ ]]; }
+
+# ---------------------------------------------------------------- capability --
+# Reported to the MCP server so it can present only what a host can actually do.
+caps() {
+  local c=()
+  have liquidctl && [ -n "$WORKING_SERIAL" ] && c+=(fan_liquidctl)
+  hwmon_dir >/dev/null 2>&1 && [ -n "$PWM_CHANNELS" ] && c+=(fan_hwmon)
+  have sensors    && c+=(sensors)
+  have openrgb    && c+=(rgb_openrgb)
+  have nvidia-smi && c+=(gpu_nvidia)
+  have qm         && c+=(proxmox)
+  unit_exists fan-curve.service  && c+=(svc_fan_curve)
+  unit_exists rgb-follow.service && c+=(svc_rgb_follow)
+  [ -d /sys/class/hwmon ] && c+=(hwmon)
+  printf '%s\n' "${c[*]:-none}"
+}
+
+# ------------------------------------------------------------------ readings --
+read_case_temp() {
+  have sensors || return 1
+  sensors -u 2>/dev/null | awk '/case temp:/{f=1;next} f&&/_input:/{printf "%d",$2+0.5; exit}'
+}
+
+# Every *_input under hwmon that looks like a temperature, with its label.
+read_all_temps() {
+  have sensors || return 1
+  sensors 2>/dev/null | awk '
+    /^[a-zA-Z0-9_-]+-[a-z]/ { chip=$0; next }
+    /^[A-Za-z].*:[ \t]*\+?[0-9.]+°C/ {
+      label=$0; sub(/:.*/,"",label)
+      val=$0; sub(/^[^+]*\+?/,"",val); sub(/°C.*/,"",val)
+      printf "%s|%s|%s\n", chip, label, val
+    }'
+}
+
+read_fan_rpm() {
+  local shown=0 d f n rpm
+  if have liquidctl && [ -n "$WORKING_SERIAL" ]; then
+    liquidctl --serial "$WORKING_SERIAL" status 2>/dev/null \
+      | awk '/[Ff]an.*speed/ {print}' | head -20
+    shown=1
+  fi
+  if d=$(hwmon_dir 2>/dev/null); then
+    for f in "$d"/fan[0-9]_input; do
+      [ -r "$f" ] || continue
+      n=$(basename "$f" _input); rpm=$(cat "$f" 2>/dev/null)
+      # Silent channels are unpopulated headers, not faults — don't list them.
+      [ "${rpm:-0}" -gt 0 ] && printf '%s: %s rpm (pwm=%s mode=%s)\n' \
+        "$n" "$rpm" "$(cat "$d/pwm${n#fan}" 2>/dev/null)" "$(cat "$d/pwm${n#fan}_enable" 2>/dev/null)"
+    done
+    shown=1
+  fi
+  [ "$shown" -eq 1 ] || return 1
+}
+
+read_gpu() {
+  have nvidia-smi || return 1
+  nvidia-smi --query-gpu=name,temperature.gpu,fan.speed,utilization.gpu,power.draw \
+             --format=csv,noheader 2>/dev/null
+}
+
+override_state() {
+  local f
+  for f in fan rgb; do
+    if [ -f "$STATE_DIR/$f.override" ]; then
+      printf '%s_override=%s\n' "$f" "$(cat "$STATE_DIR/$f.override" 2>/dev/null)"
+    else
+      printf '%s_override=none\n' "$f"
+    fi
+  done
+}
+
+# Cancel any pending revert timer for a subsystem.
+clear_timer() {
+  local unit="thermalctl-revert-$1"
+  systemctl stop "${unit}.timer" >/dev/null 2>&1
+  systemctl reset-failed "${unit}.service" >/dev/null 2>&1
+  rm -f "$STATE_DIR/$1.override"
+}
+
+# Schedule "restore automatic control" in N minutes. systemd-run is used instead
+# of a background sleep so the revert survives this SSH session ending — the
+# session ends the moment this script returns.
+arm_timer() {
+  local what="$1" mins="$2" svc="$3"
+  clear_timer "$what"
+  # Revert through the helper, not `systemctl restart` directly: the helper also
+  # deletes the override marker. Restarting the service alone leaves the marker
+  # behind, and `status` then reports a manual override that expired long ago.
+  systemd-run --quiet --on-active="${mins}min" \
+              --unit="thermalctl-revert-${what}" \
+              /usr/local/sbin/thermalctl-revert "$what" "$svc" >/dev/null 2>&1 \
+    || { log "failed to arm ${what} revert timer"; return 1; }
+  printf '%s until %s\n' "manual" "$(date -d "+${mins} minutes" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)" \
+    > "$STATE_DIR/$what.override"
+  return 0
+}
+
+# ---------------------------------------------------------------- fan verbs --
+# hwmon PWM backend. pwmN_enable: 1 = manual, 5 = the BIOS smart-fan curve on
+# nct6775-class chips. We flip to manual, write a duty, and hand it back later.
+fan_set_hwmon() {
+  local hw="$1" pct="$2" ttl="$3" ch duty okc=0 failc=0 lasterr=""
+  duty=$(( pct * 255 / 100 ))
+  [ "$duty" -gt 255 ] && duty=255
+  for ch in $PWM_CHANNELS; do
+    if [ ! -w "$hw/pwm${ch}" ]; then
+      failc=$((failc + 1)); lasterr="pwm${ch} not writable"; continue
+    fi
+    if ! printf '1' > "$hw/pwm${ch}_enable" 2>/dev/null; then
+      failc=$((failc + 1)); lasterr="pwm${ch}_enable rejected manual mode"; continue
+    fi
+    if printf '%s' "$duty" > "$hw/pwm${ch}" 2>/dev/null; then
+      okc=$((okc + 1))
+    else
+      failc=$((failc + 1)); lasterr="pwm${ch} write rejected"
+    fi
+  done
+  if [ "$okc" -eq 0 ]; then
+    fan_restore_hwmon "$hw"
+    die "fan control unavailable — all ${failc} channel(s) failed: ${lasterr}"
+  fi
+  arm_timer fan "$ttl" "@hwmon" || die "applied ${pct}% but could NOT arm revert timer"
+  log "hwmon fans set to ${pct}% (pwm ${duty}) for ${ttl}m"
+  ok "fans=${pct}% pwm=${duty} channels='${PWM_CHANNELS}' applied=${okc} failed=${failc} revert_in=${ttl}m"
+}
+
+fan_restore_hwmon() {
+  local hw="$1" ch
+  for ch in $PWM_CHANNELS; do
+    printf '%s' "$PWM_RESTORE" > "$hw/pwm${ch}_enable" 2>/dev/null
+  done
+}
+
+fan_set() {
+  local pct="$1" ttl="${2:-$FAN_TTL_DEFAULT}" f rc=0
+  v_pct "$pct"  || die "bad percent (0-100)"
+  v_ttl "$ttl"  || die "bad ttl (1-${TTL_MAX} minutes)"
+  [ "$pct" -eq 0 ] && die "0% is refused — fans must keep spinning (floor ${FAN_FLOOR}%)"
+  if [ "$pct" -lt "$FAN_FLOOR" ]; then
+    log "clamped requested ${pct}% to floor ${FAN_FLOOR}%"
+    pct="$FAN_FLOOR"
+  fi
+  # hwmon/PWM backend takes precedence where present: it is a direct sysfs write
+  # with no vendor driver in the way, so it either works or fails loudly.
+  local hw
+  if hw=$(hwmon_dir 2>/dev/null) && [ -n "$PWM_CHANNELS" ]; then
+    fan_set_hwmon "$hw" "$pct" "$ttl"
+    return
+  fi
+
+  have liquidctl || die "no fan control backend on this host (no hwmon PWM, no liquidctl)"
+  [ -n "$WORKING_SERIAL" ] || die "no fan controller serial configured for this host"
+
+  # fan-curve.service re-asserts its own value every 20s, so a manual set only
+  # sticks if the curve loop is stopped first.
+  if unit_exists fan-curve.service && unit_active fan-curve.service; then
+    systemctl stop fan-curve.service >/dev/null 2>&1
+  fi
+  # Capture liquidctl's stderr rather than discarding it. The USB fan controller
+  # driver is tagged "(broken)" upstream and its writes can fail on every channel
+  # while reads keep working — swallowing that turns a dead fan controller into a
+  # cheerful ✅. Report what actually happened.
+  local okc=0 failc=0 lasterr=""
+  for f in $FAN_CHANNELS; do
+    local err
+    err=$(liquidctl --serial "$WORKING_SERIAL" set "fan${f}" speed "$pct" 2>&1 >/dev/null)
+    if [ -n "$err" ]; then
+      failc=$((failc + 1)); lasterr="$err"
+    else
+      okc=$((okc + 1))
+    fi
+  done
+
+  if [ "$okc" -eq 0 ]; then
+    # Nothing was applied — restore automatic control rather than leaving the
+    # curve stopped on the strength of a change that never landed.
+    unit_exists fan-curve.service && systemctl start fan-curve.service >/dev/null 2>&1
+    log "fan set FAILED on all ${failc} channel(s): ${lasterr}"
+    die "fan control unavailable — all ${failc} channel(s) rejected the write: ${lasterr}"
+  fi
+
+  if unit_exists fan-curve.service; then
+    arm_timer fan "$ttl" fan-curve.service || die "applied ${pct}% but could NOT arm revert timer"
+    log "fans manually set to ${pct}% for ${ttl}m (${okc} ok, ${failc} failed)"
+    ok "fans=${pct}% applied=${okc} failed=${failc} revert_in=${ttl}m"
+  else
+    ok "fans=${pct}% applied=${okc} failed=${failc} revert=none (no fan-curve.service on this host)"
+  fi
+}
+
+fan_auto() {
+  clear_timer fan
+  local hw
+  if hw=$(hwmon_dir 2>/dev/null) && [ -n "$PWM_CHANNELS" ]; then
+    fan_restore_hwmon "$hw"
+    log "hwmon fans returned to mode ${PWM_RESTORE}"
+    ok "automatic fan control resumed (pwm mode ${PWM_RESTORE})"
+    return
+  fi
+  unit_exists fan-curve.service || die "no automatic fan control on this host"
+  systemctl restart fan-curve.service >/dev/null 2>&1 || die "could not restart fan-curve.service"
+  log "fan curve resumed"
+  ok "automatic fan curve resumed"
+}
+
+curve_get() {
+  if [ -f "$CURVE_ENV" ]; then
+    printf 'source=%s\n' "$CURVE_ENV"; cat "$CURVE_ENV"
+  else
+    printf 'source=script-default\n'
+    grep -m1 '^CURVE=' /usr/local/sbin/fan-curve.sh 2>/dev/null || printf 'CURVE=<unknown>\n'
+  fi
+}
+
+curve_set() {
+  local curve="$1"
+  v_curve "$curve" || die "bad curve format — expected ascending 'temp:pct' pairs"
+  # Reject non-ascending or below-floor points before writing anything.
+  local prev_t=-1 prev_p=-1 pair t p
+  for pair in $curve; do
+    t="${pair%%:*}"; p="${pair##*:}"
+    [ "$t" -le 100 ] || die "curve temp ${t} out of range"
+    [ "$p" -le 100 ] || die "curve percent ${p} out of range"
+    [ "$p" -ge "$FAN_FLOOR" ] || die "curve point ${pair} is below the ${FAN_FLOOR}% floor"
+    [ "$t" -gt "$prev_t" ] || die "curve temps must ascend (${pair} follows ${prev_t})"
+    [ "$p" -ge "$prev_p" ] || die "curve percents must not decrease (${pair})"
+    prev_t="$t"; prev_p="$p"
+  done
+  mkdir -p "$(dirname "$CURVE_ENV")"
+  [ -f "$CURVE_ENV" ] && cp -a "$CURVE_ENV" "${CURVE_ENV}.$(date +%Y%m%d%H%M%S).bak"
+  printf 'CURVE=%s\n' "$curve" > "$CURVE_ENV"
+  unit_exists fan-curve.service && systemctl restart fan-curve.service >/dev/null 2>&1
+  log "fan curve set to '${curve}'"
+  ok "curve=${curve}"
+}
+
+# ---------------------------------------------------------------- rgb verbs --
+orgb() { QT_QPA_PLATFORM=offscreen timeout 60 openrgb --client "$ORGB_HOST" "$@"; }
+
+# The OpenRGB client opens two connections and concatenates both controller
+# lists, so every device is reported twice. Deduping by NAME is wrong (there are
+# two genuinely distinct units of the same model) — detect the exact doubling instead.
+rgb_devices() {
+  local raw n half a b
+  raw=$(orgb --nodetect -l 2>/dev/null | grep -vE '^<' | awk '
+    /^[0-9]+:/  { if (idx != "") print idx "|" name "|" modes
+                  idx=$1; sub(":","",idx); name=$0; sub(/^[0-9]+: /,"",name); modes="" }
+    /^  Modes:/ { modes=$0; sub(/^  Modes: /,"",modes) }
+    END         { if (idx != "") print idx "|" name "|" modes }')
+  n=$(printf '%s\n' "$raw" | grep -c . || true)
+  if [ "${n:-0}" -gt 1 ] && [ $((n % 2)) -eq 0 ]; then
+    half=$((n / 2))
+    a=$(printf '%s\n' "$raw" | head -n "$half" | cut -d'|' -f2)
+    b=$(printf '%s\n' "$raw" | tail -n "$half" | cut -d'|' -f2)
+    [ "$a" = "$b" ] && { printf '%s\n' "$raw" | head -n "$half"; return 0; }
+  fi
+  printf '%s\n' "$raw"
+}
+
+rgb_apply() {
+  local want="$1" idx name modes n=0 rc=0
+  systemctl is-active --quiet openrgb-server.service || systemctl start openrgb-server.service >/dev/null 2>&1
+  for _ in $(seq 1 20); do ss -tln 2>/dev/null | grep -q ':6742 ' && break; sleep 1; done
+  while IFS='|' read -r idx name modes; do
+    [ -n "${idx:-}" ] || continue
+    n=$((n + 1))
+    if [ "$want" = off ]; then
+      if printf '%s' "$modes" | grep -qw 'Off'; then
+        orgb -d "$idx" -m off >/dev/null 2>&1 || rc=1
+      else
+        orgb -d "$idx" -m direct -c 000000 >/dev/null 2>&1 || rc=1
+      fi
+    else
+      orgb -d "$idx" -m direct -c "$want" >/dev/null 2>&1 || rc=1
+    fi
+  done < <(rgb_devices)
+  [ "$n" -gt 0 ] || return 1
+  printf '%s' "$n"
+  [ $rc -eq 0 ]
+}
+
+rgb_set() {
+  local color="$1" ttl="${2:-$RGB_TTL_DEFAULT}" n
+  have openrgb || die "openrgb not installed on this host"
+  if [ "$color" != "off" ]; then v_hex "$color" || die "bad colour — expected 6 hex digits or 'off'"; fi
+  v_ttl "$ttl" || die "bad ttl (1-${TTL_MAX} minutes)"
+
+  # rgb-follow.service has ExecStopPost=rgb-mode.sh off, so stopping it blanks
+  # the lights. The colour must therefore be applied AFTER the stop, never before.
+  if unit_exists rgb-follow.service && unit_active rgb-follow.service; then
+    systemctl stop rgb-follow.service >/dev/null 2>&1
+    sleep 1
+  fi
+  n=$(rgb_apply "$color") || true
+  [ -n "$n" ] || die "OpenRGB server reported no devices — nothing applied"
+  if unit_exists rgb-follow.service; then
+    arm_timer rgb "$ttl" rgb-follow.service || die "applied but could NOT arm revert timer"
+    log "rgb manually set to ${color} for ${ttl}m"
+    ok "rgb=${color} devices=${n} revert_in=${ttl}m"
+  else
+    ok "rgb=${color} devices=${n} revert=none (no rgb-follow.service on this host)"
+  fi
+}
+
+rgb_auto() {
+  clear_timer rgb
+  unit_exists rgb-follow.service || die "no rgb-follow.service on this host"
+  systemctl restart rgb-follow.service >/dev/null 2>&1 || die "could not restart rgb-follow.service"
+  log "rgb automation resumed"
+  ok "automatic RGB policy resumed"
+}
+
+# ------------------------------------------------------------------- status --
+do_status() {
+  printf 'host=%s\n' "$(hostname)"
+  printf 'caps=%s\n' "$(caps)"
+  printf 'fan_floor=%s\n' "$FAN_FLOOR"
+  override_state
+  for u in fan-curve.service rgb-follow.service openrgb-server.service; do
+    if unit_exists "$u"; then
+      printf 'svc %s=%s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)"
+    fi
+  done
+  local ct; ct=$(read_case_temp 2>/dev/null)
+  [ -n "${ct:-}" ] && printf 'case_temp_c=%s\n' "$ct"
+  printf -- '--- temps ---\n'; read_all_temps 2>/dev/null | head -40
+  printf -- '--- fans ---\n';  read_fan_rpm   2>/dev/null | head -20
+  printf -- '--- gpu ---\n';   read_gpu       2>/dev/null | head -5
+  printf -- '--- rgb ---\n'
+  if have openrgb && ss -tln 2>/dev/null | grep -q ':6742 '; then
+    rgb_devices 2>/dev/null | while IFS='|' read -r i n m; do printf '[%s] %s\n' "$i" "$n"; done
+  else
+    printf 'openrgb server not listening\n'
+  fi
+}
+
+# -------------------------------------------------------------------- entry --
+# sshd hands the client's requested command here; we never execute it as a shell.
+CMD="${SSH_ORIGINAL_COMMAND:-}"
+[ -n "$CMD" ] || die "no command (this key is restricted to the thermalctl verb set)"
+# Refuse anything containing shell metacharacters outright — belt and braces on
+# top of the per-argument regexes below.
+case "$CMD" in
+  *';'*|*'|'*|*'&'*|*'$'*|*'`'*|*'>'*|*'<'*|*$'\n'*) die "illegal characters in command" ;;
+esac
+read -r -a ARGS <<< "$CMD"
+
+case "${ARGS[0]:-}" in
+  ping)     ok "thermalctl-agent alive on $(hostname)" ;;
+  caps)     caps ;;
+  status)   do_status ;;
+  fan)
+    case "${ARGS[1]:-}" in
+      set)  fan_set "${ARGS[2]:-}" "${ARGS[3]:-$FAN_TTL_DEFAULT}" ;;
+      auto) fan_auto ;;
+      *)    die "usage: fan set <pct> [ttl_min] | fan auto" ;;
+    esac ;;
+  curve)
+    case "${ARGS[1]:-}" in
+      get) curve_get ;;
+      set) curve_set "${ARGS[*]:2}" ;;
+      *)   die "usage: curve get | curve set <t:p t:p ...>" ;;
+    esac ;;
+  rgb)
+    case "${ARGS[1]:-}" in
+      set)  rgb_set "${ARGS[2]:-}" "${ARGS[3]:-$RGB_TTL_DEFAULT}" ;;
+      auto) rgb_auto ;;
+      *)    die "usage: rgb set <hex|off> [ttl_min] | rgb auto" ;;
+    esac ;;
+  *) die "unknown verb '${ARGS[0]}' — allowed: ping caps status fan curve rgb" ;;
+esac

@@ -1,0 +1,24 @@
+# This repository must never contain real infrastructure detail.
+# Everything below is a category that has leaked out of a project like this before.
+*.env
+.env
+.env.*
+*.bak
+*.bak.*
+id_ed25519
+id_ed25519.*
+id_rsa
+id_rsa.*
+known_hosts
+hosts.yaml
+devices.yaml
+*-secrets/
+*-data/
+token.json
+client_secret*.json
+
+# OS / editor noise
+.DS_Store
+__pycache__/
+*.pyc
+*.log
