@@ -239,3 +239,50 @@ learn the indirection.)
 **The lesson.** A capability the model can't *find* is as good as absent, and "the tool works" and
 "the model can use the tool" are different claims that need testing separately. The bug was not in
 any component — it was in an optimization that assumed a stronger caller than this system has.
+
+---
+
+## 9. A documented config flag that was accepted and never wired
+
+**Symptom.** The agent runtime documents a setting that turns on export of conversation
+trajectories — the full record of what a model was asked, what it reasoned, which tools it
+called, in a standard training-data format. The plan for the next phase of work depended on
+having that data. The documentation gives the exact YAML. Setting it produced no files.
+
+**The false trail.** Every obvious cause looked plausible and was wrong. Was the service reading
+the config at all? Yes — other keys in the same block were demonstrably in effect. Was the
+output going somewhere unexpected? The docs say files land in the working directory, so the
+first assumption was a working-directory mismatch between the interactive command and the
+long-running service. A query was run from a freshly created empty directory to remove that
+variable. Still nothing, anywhere on the box.
+
+**What it actually was.** The flag is real and it works — for two callers. Reading the source
+rather than the documentation showed that the batch runner and the runtime's own
+direct-invocation entry point both pass it through. The interactive command and the
+long-running service build their agent by a **third** path that never passes the parameter at
+all. The key is parsed, accepted, silently ignored, and reported nowhere. No warning, no
+"unknown option", no error. Documentation described a capability that exists in the codebase
+but is unreachable from the way this system actually runs.
+
+**The part that changed the conclusion.** Having established the export didn't work, the next
+question was what it would have cost. The answer was: nothing, because the data was already
+being captured. The runtime maintains a local database of sessions and messages that is always
+on and needs no configuration — and it stores strictly more than the export would have
+produced, including per-message reasoning and the raw tool-call payloads. The project's own
+notes had recorded "trajectory logging has never been on," and that was **wrong in a way that
+mattered**: capture had been running the whole time. What was missing was a converter.
+
+So the fix was thirty lines of read-only SQL against a database that already had months of
+history, on a scheduled timer, instead of a blocked dependency. A planned future task that had
+been deferred for want of a dataset turned out to be much less blocked than the plan assumed.
+
+**Rules adopted.**
+
+> A configuration key that is accepted is not a configuration key that is honored. If a setting
+> is supposed to produce an artifact, verify the artifact — not the absence of an error.
+
+> Before building a data pipeline, check what the system already stores. The most common reason
+> a capability is missing is that nobody looked for it under a different name.
+
+An inert config line is worse than no line, because the next person to read the file will
+believe it. It was removed rather than left in place looking load-bearing.
